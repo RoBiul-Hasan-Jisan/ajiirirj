@@ -15,6 +15,7 @@ from urllib.parse import urlparse, parse_qs, unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from dengue_watch.features import build_features
+from dengue_watch import future as FUT
 
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = Path(os.getenv("DENGUE_DATA", ROOT / "data/bangladesh_dengue_large_dataset.csv"))
@@ -39,6 +40,7 @@ LATEST_DATE = _df.date.max()
 LATEST = _df[_df.date.eq(LATEST_DATE)].copy()
 with open(RESULTS_PATH, encoding="utf-8") as f:
     RESULTS = json.load(f)
+DEPLOYED_MODEL = "Gradient Boosting (tuned, Poisson)"
 
 
 def _forecast_features(h: int) -> pd.DataFrame:
@@ -163,7 +165,9 @@ def dashboard_payload(params):
             "water_logging_risk_index": round(float(r.water_logging_risk_index), 3),
             "sanitation_score": round(float(r.sanitation_score), 3),
         })
-    metrics = scenario.get("metrics", {}).get(scenario.get("best", ""), {})
+    # The saved models/model_hN.joblib files are ALWAYS the refit gradient-boosting model, so report
+    # that model's held-out metrics (not whichever model happened to rank "best" during training).
+    metrics = scenario.get("metrics", {}).get(DEPLOYED_MODEL, {})
     return {
         "source": "trained_model", "model_connected": True, "city": city, "cities": CITIES,
         "horizon": horizon, "horizon_label": "Latest-week nowcast (weather only)" if horizon == 0 else f"{horizon}-week-ahead forecast",
@@ -173,7 +177,7 @@ def dashboard_payload(params):
         "actual_latest_week_cases": int(_df[(_df.city.eq(city)) & (_df.date.eq(LATEST_DATE))].dengue_cases.sum()),
         "priority_1_count": sum(w["priority"] == "Priority 1" for w in ward_payload),
         "priority_2_count": sum(w["priority"] == "Priority 2" for w in ward_payload),
-        "best_model": scenario.get("best", "Saved horizon model"), "test_metrics": metrics,
+        "best_model": DEPLOYED_MODEL, "test_metrics": metrics,
         "historical": hist_payload, "forecast_by_horizon": horizon_series, "wards": ward_payload,
         "feature_importance": factors,
         "data_period": {"start": _df.date.min().strftime("%Y-%m-%d"), "end": LATEST_DATE.strftime("%Y-%m-%d")},
@@ -335,7 +339,10 @@ def risk_payload(params):
         "backtest": any(w["actual_cases"] is not None for w in wards),
         "actual_total": (int(sum(w["actual_cases"] or 0 for w in wards)) if any(w["actual_cases"] is not None for w in wards) else None),
         "date_range": {"min": pd.Timestamp(DATES[40]).strftime("%Y-%m-%d"), "max": LATEST_DATE.strftime("%Y-%m-%d")},
-        "model": RESULTS.get("scenarios", {}).get(f"h{h}", {}).get("best", "Gradient boosting"),
+        "model": DEPLOYED_MODEL,
+        "backtest_in_sample": bool(any(w["actual_cases"] is not None for w in wards)),
+        "backtest_warning": ("Deployed models were refit on ALL data (2016-2025), so back-tests on past dates are in-sample and look "
+                             "better than real accuracy. Honest held-out accuracy (2023-2025) is in results.json / the Model & data page."),
     }
 
 
@@ -356,6 +363,84 @@ def map_payload(params):
             "risk_note": meta["risk_note"], "model": meta["model"], "cities": cities, "wards": wards}
 
 
+# ---------------------------------------------------------------------------
+# Long-range forecast: any date AFTER the data (2026, 2027, ... up to FUTURE_MAX)
+# ---------------------------------------------------------------------------
+FUTURE_MAX = pd.Timestamp("2030-12-31")
+_FUT_SCEN = FUT.weather_scenarios(_df)
+_FUT_CACHE: dict = {}
+try:
+    FUTURE_BACKTEST = json.loads((ROOT / "artifacts/future_backtest.json").read_text(encoding="utf-8"))
+except Exception:
+    FUTURE_BACKTEST = None
+
+
+def _future_long(end, rain_mult, temp_shift):
+    key = (pd.Timestamp(end).strftime("%Y-%m-%d"), round(rain_mult, 2), round(temp_shift, 2))
+    if key not in _FUT_CACHE:
+        dates = FUT.forecast_dates(_df, None, end)
+        _FUT_CACHE[key] = FUT.forecast_weather_only(_df, MODELS[0], dates, _FUT_SCEN, rain_mult, temp_shift)
+        if len(_FUT_CACHE) > 6:
+            _FUT_CACHE.pop(next(iter(_FUT_CACHE)))
+    return _FUT_CACHE[key]
+
+
+def future_payload(params):
+    city = params.get("city", ["Dhaka North"])[0]
+    if city != "All" and city not in CITIES:
+        raise ValueError(f"Unknown city. Choose 'All' or one of: {', '.join(CITIES)}")
+    try:
+        rain_mult = float(params.get("rain_mult", ["1"])[0]); temp_shift = float(params.get("temp_shift", ["0"])[0])
+        start = pd.Timestamp(params.get("start", [str((LATEST_DATE + timedelta(weeks=1)).date())])[0])
+        end = pd.Timestamp(params.get("end", ["2027-12-31"])[0])
+    except Exception:
+        raise ValueError("start/end must be dates like 2026-01-05 and rain_mult/temp_shift numbers")
+    if not 0.3 <= rain_mult <= 2.5: raise ValueError("rain_mult must be between 0.3 and 2.5")
+    if not -2 <= temp_shift <= 3: raise ValueError("temp_shift must be between -2 and +3 degrees C")
+    if end <= LATEST_DATE: raise ValueError(f"end must be after the last data week ({LATEST_DATE.date()}); use /api/risk for dates inside the data")
+    if end > FUTURE_MAX: raise ValueError(f"end must be on or before {FUTURE_MAX.date()}")
+    if start > end: raise ValueError("start must be before end")
+    cache_end = pd.Timestamp("2028-12-31") if end <= pd.Timestamp("2028-12-31") else FUTURE_MAX  # 2 buckets -> better cache reuse
+    long = _future_long(cache_end, rain_mult, temp_shift)
+    long = long[(long.date >= start) & (long.date <= end)].copy()
+    if long.empty: raise ValueError("No forecast weeks fall inside that date range")
+    if city != "All": long = long[long.city.eq(city)]
+    long["year"] = long.date.dt.year; long["month"] = long.date.dt.to_period("M").astype(str)
+    weekly = FUT.summarize(long, by=("date",))
+    monthly = FUT.summarize(long, by=("month",))
+    yearly = FUT.summarize(long, by=("year",))
+    near = {}
+    if start <= LATEST_DATE + timedelta(weeks=12):
+        for h in range(1, 13):
+            pr = get_predictions(h)
+            if city != "All": pr = pr[pr.city.eq(city)]
+            near[(LATEST_DATE + timedelta(weeks=h)).strftime("%Y-%m-%d")] = float(pr.predicted_cases.sum())
+    wk = [{"date": r.date.strftime("%Y-%m-%d"), "expected": round(r.expected, 1), "p10": round(r.p10, 1), "p90": round(r.p90, 1),
+           "near_term_model": (round(near[r.date.strftime("%Y-%m-%d")], 1) if r.date.strftime("%Y-%m-%d") in near else None)}
+          for r in weekly.itertuples()]
+    ward = long.groupby(["ward_id", "city", "date"]).predicted_cases.mean().reset_index()
+    wsum = ward.groupby(["ward_id", "city"]).predicted_cases.agg(total="sum", peak="max").reset_index()
+    pk = ward.loc[ward.groupby("ward_id").predicted_cases.idxmax()][["ward_id", "date"]].rename(columns={"date": "peak_date"})
+    wsum = wsum.merge(pk, on="ward_id").sort_values("total", ascending=False)
+    wards = [{"ward_id": r.ward_id, "city": r.city, "expected_total": round(r.total, 1), "peak_week": r.peak_date.strftime("%Y-%m-%d"),
+              "peak_expected_per_week": round(r.peak, 2), "peak_risk": risk_level(float(r.peak))} for r in wsum.itertuples()]
+    bt = FUTURE_BACKTEST["mean"] if FUTURE_BACKTEST else None
+    return {
+        "city": city, "start": start.strftime("%Y-%m-%d"), "end": end.strftime("%Y-%m-%d"), "last_data_week": LATEST_DATE.strftime("%Y-%m-%d"),
+        "rain_mult": rain_mult, "temp_shift": temp_shift, "n_weather_scenarios": int(long.scenario.nunique()),
+        "weeks": len(wk), "weekly": wk,
+        "monthly": [{"month": r.month, "expected": round(r.expected), "p10": round(r.p10), "p90": round(r.p90)} for r in monthly.itertuples()],
+        "yearly": [{"year": int(r.year), "expected": round(r.expected), "p10": round(r.p10), "p90": round(r.p90)} for r in yearly.itertuples()],
+        "wards": wards, "backtest": FUTURE_BACKTEST,
+        "accuracy_summary": ({"ward_week_R2": round(bt["R2"], 2), "city_week_R2": round(bt["R2_city_week"], 2),
+                              "ward_week_R2_if_weather_known": round(bt["R2_if_real_weather_known"], 2),
+                              "seasonal_average_baseline_R2": round(bt["R2_climatology_baseline"], 2)} if bt else None),
+        "notice": ("Long-range forecast: future weather is unknown, so each of the past years' weather patterns is replayed as a scenario. "
+                   "It shows a typical season and a plausible range, NOT a prediction of which specific week an outbreak will hit. "
+                   "Held-out yearly totals were off by -16% to +26%. It cannot know about new outbreaks, control programmes, serotype shifts or climate trends."),
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, status, body, content_type="application/json; charset=utf-8"):
         raw = body if isinstance(body, bytes) else (json.dumps(body, ensure_ascii=False).encode("utf-8") if content_type.startswith("application/json") else str(body).encode("utf-8"))
@@ -371,6 +456,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if parsed.path == "/api/health":
                 return self._send(200, health_payload())
+            if parsed.path == "/api/future":
+                return self._send(200, future_payload(parse_qs(parsed.query)))
             if parsed.path == "/api/map":
                 return self._send(200, map_payload(parse_qs(parsed.query)))
             if parsed.path == "/api/risk":

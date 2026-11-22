@@ -1,4 +1,4 @@
-"""Smoke-test model loading and the 2–4 week dashboard predictions."""
+"""Smoke-test model loading, the 0-12 week dashboard predictions and the long-range (2026+) forecast."""
 import app
 
 print(app.health_payload())
@@ -8,4 +8,9 @@ for city in app.CITIES:
         assert payload["model_connected"] and payload["wards"]
         print(f"OK | {city} | {horizon}-week | {payload['ward_count']} wards | "
               f"{payload['predicted_total_cases']} expected cases | "
-              f"risk bands={payload['risk_counts']}")
+              f"priority-1 wards={payload['priority_1_count']}, priority-2 wards={payload['priority_2_count']}")
+
+# long-range forecast beyond the data
+f = app.future_payload({"city": ["Dhaka North"], "start": ["2026-01-05"], "end": ["2027-12-31"]})
+assert f["weeks"] > 100 and f["yearly"] and f["wards"]
+print("OK | future 2026-2027 | Dhaka North | yearly:", f["yearly"])

@@ -72,7 +72,7 @@ async function runRisk(){
     out.innerHTML=`<div class="risk-hero">
       <div class="risk-big rk-${d.city_risk}"><small>${escapeHtml(d.city.toUpperCase())} · ${d.horizon}-WEEK OUTLOOK</small><b>${d.city_risk}</b><span>${msgs[d.city_risk]}</span></div>
       <div class="risk-side"><div class="risk-counts">${['Critical','High','Medium','Low'].map(k=>`<div class="rc rk-${k}"><b>${d.counts[k]}</b><span>${k.toUpperCase()}</span></div>`).join('')}</div>
-      <div class="risk-cmp"><span>From<br><b>${dateFmt(d.origin_date)}</b></span><span>Predicts week of<br><b>${dateFmt(d.target_date)}</b></span><span>Expected cases<br><b>${fmt(d.city_expected_cases)}</b></span>${d.backtest?`<span>Actually reported<br><b>${fmt(d.actual_total)}</b></span>`:`<span>Actual<br><b>not in data</b></span>`}</div></div>
+      <div class="risk-cmp"><span>From<br><b>${dateFmt(d.origin_date)}</b></span><span>Predicts week of<br><b>${dateFmt(d.target_date)}</b></span><span>Expected cases<br><b>${fmt(d.city_expected_cases)}</b></span>${d.backtest?`<span title="${(d.backtest_warning||'').replace(/"/g,'')}">Actually reported (in-sample ⓘ)<br><b>${fmt(d.actual_total)}</b></span>`:`<span>Actual<br><b>not in data</b></span>`}</div></div>
       <div class="lag-box"><h4>Rainfall, last 8 weeks${d.rain_mult!==1?` (recent 4 wks ×${d.rain_mult})`:''}</h4>${rainLagChart(d.rainfall_8w,d.rain_mult)}</div></div>
       <div class="ward-cards">${d.wards.slice(0,6).map((w,i)=>wardCard(w,i+1)).join('')}</div>
       <div class="more-row"><p class="risk-note">${escapeHtml(d.risk_note)} Model: ${escapeHtml(d.model)}. Research decision-support only, not an official alert.</p><button class="link-btn" data-go="wards">All ${d.wards.length} wards →</button></div>`;
