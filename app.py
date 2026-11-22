@@ -12,10 +12,14 @@ import numpy as np
 import pandas as pd
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
+import time
+import threading
+from datetime import date
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 from dengue_watch.features import build_features
 from dengue_watch import future as FUT
+from dengue_watch.chatbot import ChatEngine
 
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = Path(os.getenv("DENGUE_DATA", ROOT / "data/bangladesh_dengue_large_dataset.csv"))
@@ -441,6 +445,94 @@ def future_payload(params):
     }
 
 
+# ---------------------------------------------------------------------------
+# Chatbot: backend adapter (the engine in dengue_watch/chatbot.py only talks to this)
+# ---------------------------------------------------------------------------
+try:
+    CLASSIFICATION = json.loads((ROOT / "artifacts/classification_metrics.json").read_text(encoding="utf-8"))
+except Exception:
+    CLASSIFICATION = None
+
+
+class AppBackend:
+    cities = CITIES
+    latest = LATEST_DATE
+
+    def today(self):
+        return date.today()
+
+    def risk(self, city, h, as_of, rain_mult):
+        params = {"city": [city], "horizon": [str(h)], "rain_mult": [str(rain_mult)]}
+        if as_of:
+            params["as_of"] = [str(as_of)]
+        return risk_payload(params)
+
+    def future(self, city, start, end, rain_mult, temp_shift):
+        return future_payload({"city": [city], "start": [str(start)], "end": [str(end)],
+                               "rain_mult": [str(rain_mult)], "temp_shift": [str(temp_shift)]})
+
+    def actuals(self, city, start, end):
+        d = _df[(_df.date >= pd.Timestamp(start)) & (_df.date <= pd.Timestamp(end))]
+        if city != "All":
+            d = d[d.city.eq(city)]
+        weekly = d.groupby("date").dengue_cases.sum()
+        wards = d.groupby("ward_id").dengue_cases.sum().sort_values(ascending=False).head(5)
+        return {"total": float(d.dengue_cases.sum()), "peak_week": weekly.idxmax().strftime("%Y-%m-%d") if len(weekly) else "-",
+                "peak_cases": float(weekly.max()) if len(weekly) else 0.0, "top_wards": [(k, float(v)) for k, v in wards.items()]}
+
+    def season(self, city):
+        d = _df if city == "All" else _df[_df.city.eq(city)]
+        monthly = d.groupby(d.date.dt.month).dengue_cases.sum()
+        total = float(monthly.sum()) or 1.0
+        share = {int(m): float(monthly.get(m, 0.0)) / total * 100 for m in range(1, 13)}
+        yearly = d.groupby(d.date.dt.year).dengue_cases.sum()
+        return {"monthly_share": share, "peak_month": max(share, key=share.get), "yearly": {int(y): float(v) for y, v in yearly.items()}}
+
+    def accuracy(self, h):
+        sc = RESULTS.get("scenarios", {}).get(f"h{h}", {})
+        out = {"model": DEPLOYED_MODEL, "metrics": sc.get("metrics", {}).get(DEPLOYED_MODEL, {})}
+        if CLASSIFICATION:
+            t = CLASSIFICATION.get("default_threshold")
+            rows = CLASSIFICATION.get("horizons", {}).get(str(h), [])
+            out["classification"] = next((r for r in rows if r["t"] == t), None)
+        return out
+
+    def info(self):
+        return {"wards": int(_df.ward_id.nunique()), "cities": CITIES,
+                "start": _df.date.min().strftime("%Y-%m-%d"), "end": LATEST_DATE.strftime("%Y-%m-%d")}
+
+
+CHAT = ChatEngine(AppBackend())
+_RATE: dict = {}
+_RATE_LOCK = threading.Lock()
+RATE_LIMIT, RATE_WINDOW = 40, 60  # messages per IP per minute
+MAX_BODY = 8 * 1024
+
+
+def rate_ok(ip: str) -> bool:
+    now = time.time()
+    with _RATE_LOCK:
+        hits = [t for t in _RATE.get(ip, []) if now - t < RATE_WINDOW]
+        if len(hits) >= RATE_LIMIT:
+            _RATE[ip] = hits
+            return False
+        hits.append(now)
+        _RATE[ip] = hits
+        if len(_RATE) > 2000:
+            _RATE.clear()
+    return True
+
+
+def chat_payload(body: dict) -> dict:
+    if not isinstance(body, dict):
+        raise ValueError("JSON body must be an object")
+    msg = body.get("message", "")
+    if not isinstance(msg, str):
+        raise ValueError("message must be a string")
+    lang = body.get("lang")
+    return CHAT.reply(msg, body.get("context"), lang if lang in ("en", "bn") else None)
+
+
 class Handler(BaseHTTPRequestHandler):
     def _send(self, status, body, content_type="application/json; charset=utf-8"):
         raw = body if isinstance(body, bytes) else (json.dumps(body, ensure_ascii=False).encode("utf-8") if content_type.startswith("application/json") else str(body).encode("utf-8"))
@@ -451,11 +543,35 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
+    def do_POST(self):
+        parsed = urlparse(self.path)
+        try:
+            if parsed.path != "/api/chat":
+                return self._send(404, {"error": "Not found"})
+            if not rate_ok(self.client_address[0]):
+                return self._send(429, {"error": "Too many messages - please wait a moment."})
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            if length <= 0 or length > MAX_BODY:
+                return self._send(400, {"error": "Request body must be 1-8 KB of JSON"})
+            try:
+                body = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (ValueError, UnicodeDecodeError):
+                return self._send(400, {"error": "Invalid JSON"})
+            return self._send(200, chat_payload(body))
+        except ValueError as exc:
+            return self._send(400, {"error": str(exc)})
+        except Exception as exc:
+            print(f"Chat failed: {exc}")
+            return self._send(500, {"error": "Chat failed"})
+
     def do_GET(self):
         parsed = urlparse(self.path)
         try:
             if parsed.path == "/api/health":
                 return self._send(200, health_payload())
+            if parsed.path == "/api/chat/suggestions":
+                from dengue_watch import knowledge as _K
+                return self._send(200, _K.SUGGESTIONS)
             if parsed.path == "/api/future":
                 return self._send(200, future_payload(parse_qs(parsed.query)))
             if parsed.path == "/api/map":

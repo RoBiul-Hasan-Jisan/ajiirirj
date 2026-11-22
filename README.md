@@ -38,6 +38,39 @@ python app.py
 
 Open **http://127.0.0.1:5000**. Keep the terminal running while using the dashboard. The API is served by Python's standard library HTTP server; no separate Node, Flask, or frontend build step is needed.
 
+## Dengue chatbot ("Ask Dengue Watch")
+
+A bilingual (English / বাংলা) assistant lives on the **Ask Dengue Watch** page and at `POST /api/chat`. It is a deterministic,
+explainable engine - no external LLM or API key - so it works offline and never invents numbers.
+
+| Layer | What it does | Code |
+|---|---|---|
+| Safety triage | Detects danger signs (belly pain, repeated vomiting, bleeding, drowsiness, breathing trouble, cold skin, low urine, seizure) in a personal context and answers with urgent hospital guidance + Bangladesh hotlines *before anything else* | `chatbot.py` |
+| Symptom guidance | "I have fever for 3 days" -> test timing (NS1 vs antibody), care, no NSAIDs, when to go to hospital; higher-risk groups get same-day advice. Never diagnoses, never gives drug doses | `chatbot.py` |
+| Knowledge base | 20 WHO-aligned topics in English and Bangla: symptoms, warning signs, prevention, treatment, home care, diet, platelets, testing, transmission, vaccines, myths, children/pregnancy, season, weather link... | `knowledge.py` |
+| Live model answers | City/ward risk, top wards, city comparison, any month/year up to 2030, rainfall/temperature what-ifs, history, model accuracy, action plans by risk level | `chatbot.py` + `AppBackend` in `app.py` |
+| Memory | Remembers city / ward / horizon between turns ("what about Gazipur?") | client sends back `context` |
+| Honesty | The bundled data ends 2025-12-29. If that is >12 weeks before today the bot says so and switches from the 12-week models to the seasonal long-range forecast; what-ifs in the off-season are tested on the coming peak season | `_stale()` |
+
+Examples: `risk in Dhaka North next 4 weeks`, `top wards in Gazipur`, `ward 5 in dhaka south`, `forecast for August 2026`,
+`what if rainfall doubles in Gazipur`, `compare Dhaka North and Chattogram`, `how accurate is the model`, `ঢাকা উত্তরের ঝুঁকি`.
+
+API:
+
+```bash
+curl -s -X POST localhost:5000/api/chat -H 'Content-Type: application/json' \
+  -d '{"message":"top wards in Dhaka North","context":{},"lang":"en"}'
+```
+
+The reply contains `reply` (title/text/bullets/table/notes), `severity` (`info|caution|emergency`), `suggestions` (follow-up chips),
+`sources`, `disclaimer` and the updated `context` to send with the next message. Requests are limited to 8 KB, messages to 500
+characters and 40 messages/minute/IP.
+
+Tests: `pip install pytest && python -m pytest tests -q`
+
+**Safety note:** the assistant provides general health information, not diagnosis. Hotline numbers (DGHS 16263, IEDCR 10655,
+emergency 999) should be re-verified before public deployment, and a clinician should review `knowledge.py` before it is shown to the public.
+
 ## Future forecast: 2026, 2027 and beyond (new)
 
 The 0-12 week models need the latest observed weather/cases, so they stop at 2026-03-23. For anything later the
